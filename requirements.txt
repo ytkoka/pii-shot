@@ -1,0 +1,6 @@
+rapidocr>=3.0
+onnxruntime
+pillow
+torch
+transformers
+sentencepiece

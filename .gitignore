@@ -1,0 +1,13 @@
+# 処理結果の画像（個人情報を含む元画像の取り違えを防ぐため、画像は examples/ 以外コミットしない）
+*_masked.png
+*_preview.png
+*.png
+*.jpg
+*.jpeg
+!examples/*.png
+# 個人の登録語ファイル
+*-words.txt
+__pycache__/
+.venv/
+venv/
+.DS_Store
