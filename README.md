@@ -97,6 +97,25 @@ The NER model is never updated automatically, so detection results do not change
 
 If the network is unavailable, the command exits with an error and your existing model keeps working.
 
+## Uninstalling
+
+Run these commands in order. The first one uses a tool inside pii-shot's virtual environment, so it must run before that environment is removed.
+
+```bash
+# Delete the NER model (about 1 GB) from the Hugging Face cache
+~/.pii-shot/venv/bin/hf cache rm model/tsmatz/xlm-roberta-ner-japanese
+
+# Delete the virtual environment, the OCR models inside it, and the command
+rm -rf ~/.pii-shot ~/.local/bin/pii-shot
+```
+
+Deleting the model's folder with `rm` is not enough, because the model files can be stored in a location shared across the Hugging Face cache. Skip the first command if other tools on your Mac use the same model, and repeat it for any other model you downloaded with `--ner-model`.
+
+Optionally, you can also:
+
+- delete your word list: `rm ~/.pii-shot-words.txt`;
+- remove the `export PATH="$HOME/.local/bin:$PATH"` line from `~/.zshrc`, if the installer added it and nothing else needs it.
+
 ## Limitations
 
 - **Detection is not perfect, and this tool does not guarantee anonymization.** Always check the result before sharing it; the `-p` preview makes this quick.
