@@ -11,7 +11,8 @@ pii_shot.py — スクリーンショット内の個人情報を黒塗りする�
        - ユーザー指定の語 (--mask)
   3. 該当文字の領域を塗りつぶして保存
 
-すべてローカルで動作します（NERモデルは初回のみ Hugging Face からダウンロード）。
+すべてローカルで動作します。Hugging Face に接続するのは、モデルが手元にないときと
+--update-model を実行したときだけです。画像や読み取ったテキストは送信しません。
 """
 from __future__ import annotations
 
@@ -25,6 +26,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
+
+DEFAULT_NER_MODEL = "tsmatz/xlm-roberta-ner-japanese"
+
+# ユーザーが設定していた HF_HUB_OFFLINE。通常実行では上書きするので、取得用の子プロセスにはこちらを渡す
+_USER_HF_HUB_OFFLINE = os.environ.get("HF_HUB_OFFLINE")
 
 # --------------------------------------------------------------------------
 # データ構造
@@ -51,7 +57,7 @@ class Hit:
 @dataclass
 class Options:
     use_ner: bool = True
-    ner_model: str = "tsmatz/xlm-roberta-ner-japanese"
+    ner_model: str = DEFAULT_NER_MODEL
     ner_tags: set[str] = field(default_factory=lambda: {"PER"})
     ner_threshold: float = 0.6
     mask_words: list[str] = field(default_factory=list)
@@ -219,12 +225,33 @@ NER_STOP = {
 }
 
 
+def _download_missing_model(model_name: str) -> None:
+    """手元にないモデルを取得する。
+
+    この処理のプロセスは HF_HUB_OFFLINE=1 で huggingface_hub を読み込み済みで、途中から
+    オンラインに切り替えられないので、取得は別プロセスの --update-model に任せる。
+    """
+    size = "（約1GB）" if model_name == DEFAULT_NER_MODEL else ""
+    print(f"初回のためモデルをダウンロードします{size}: {model_name}", file=sys.stderr)
+    env = dict(os.environ)
+    if _USER_HF_HUB_OFFLINE is None:
+        env.pop("HF_HUB_OFFLINE", None)
+    else:
+        env["HF_HUB_OFFLINE"] = _USER_HF_HUB_OFFLINE
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--update-model", "--ner-model", model_name]
+    # NERなしで続けると人名が隠れないまま出力されるので、取得できなければ処理を止める
+    if subprocess.run(cmd, env=env, stdout=sys.stderr).returncode != 0:
+        sys.exit("モデルを用意できなかったため、処理を中止しました。")
+
+
 def get_ner(model_name: str):
     global _ner
     if _ner is None:
         import logging
         import warnings
 
+        # local_files_only だけでは huggingface_hub の付随的な通信が残るため、import 前に設定する
+        os.environ["HF_HUB_OFFLINE"] = "1"
         warnings.filterwarnings("ignore")
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -235,14 +262,90 @@ def get_ner(model_name: str):
 
         with contextlib.redirect_stderr(io.StringIO()):
             import torch  # noqa: F401  （import 時の警告を捨てる）
-            from transformers import pipeline
+            from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
         from transformers.utils import logging as hf_logging
 
         hf_logging.set_verbosity_error()
         hf_logging.disable_progress_bar()
 
-        _ner = pipeline("token-classification", model=model_name, aggregation_strategy="simple")
+        def load():
+            tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+            model = AutoModelForTokenClassification.from_pretrained(model_name, local_files_only=True)
+            return tokenizer, model
+
+        try:
+            tokenizer, model = load()
+        except OSError:
+            _download_missing_model(model_name)
+            tokenizer, model = load()
+        _ner = pipeline("token-classification", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
     return _ner
+
+
+# --------------------------------------------------------------------------
+# モデルの管理
+# --------------------------------------------------------------------------
+
+
+def _local_snapshot(model_name: str) -> Path | None:
+    """手元のキャッシュで main が指すスナップショット。フォルダ名がリビジョンになる"""
+    from huggingface_hub import try_to_load_from_cache
+
+    # snapshot_download(local_files_only=True) は取得対象外のファイルがあると未取得と判定するので使わない
+    config = try_to_load_from_cache(model_name, "config.json")
+    return Path(config).parent if isinstance(config, str) else None
+
+
+def _model_file_patterns(repo_files: list[str]) -> list[str]:
+    """推論に必要なファイルだけを取得する。重みが safetensors と bin の両方ある場合は safetensors のみ"""
+    weights = "*.safetensors" if any(f.endswith(".safetensors") for f in repo_files) else "pytorch_model*.bin"
+    return ["*.json", "*.txt", "*.model", "*.tiktoken", weights]
+
+
+def update_model(model_name: str) -> int:
+    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+    old = _local_snapshot(model_name)
+    old_rev = old.name if old else None
+    keep_note = "手元のモデルはそのまま使えます。" if old else ""
+    try:
+        # snapshot_download は接続できないと手元のモデルを黙って返すので、先に Hub へ問い合わせる
+        info = HfApi().model_info(model_name, timeout=10)
+        new_rev = info.sha
+        patterns = _model_file_patterns([s.rfilename for s in info.siblings])
+        # ブランチ名で取得すると main の参照がダウンロード前に新リビジョンへ移り、中断すると
+        # 未完成のモデルを指してしまう。先にリビジョン固定で全ファイルをそろえてから参照を動かす
+        snapshot_download(model_name, revision=new_rev, allow_patterns=patterns)
+        snapshot_download(model_name, revision="main", allow_patterns=patterns)
+        current = _local_snapshot(model_name)
+        if current is None or current.name != new_rev:
+            raise OSError("main の参照を更新できませんでした")
+    except (RepositoryNotFoundError, GatedRepoError):
+        print(f"モデルが見つからないか、アクセスできません: {model_name}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"モデルを取得できませんでした（{type(e).__name__}）。ネットワーク接続を確認してください。{keep_note}", file=sys.stderr)
+        return 1
+
+    if old_rev is None:
+        print(f"{model_name} のリビジョン {new_rev} を取得しました。")
+    elif old_rev == new_rev:
+        print(f"更新はありませんでした（{new_rev}）。")
+    else:
+        print(f"{old_rev} → {new_rev} に更新しました。テスト画像に -p を付けて結果を確認してください。")
+    return 0
+
+
+def model_info(model_name: str) -> int:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    snapshot = _local_snapshot(model_name)
+    print(f"モデル: {model_name}")
+    print(f"リビジョン: {snapshot.name if snapshot else '未取得'}")
+    print(f"キャッシュ: {snapshot or HF_HUB_CACHE}")
+    return 0
 
 
 def detect_ner(lines: list[Line], opt: Options) -> list[Hit]:
@@ -482,7 +585,9 @@ def main(argv=None):
     ap.add_argument("--no-ner", action="store_true", help="NERモデルを使わない（正規表現と敬称ルールのみ。高速）")
     ap.add_argument("--orgs", action="store_true", help="組織名（会社名など）も隠す")
     ap.add_argument("--places", action="store_true", help="地名も隠す（住所以外の地名を含む）")
-    ap.add_argument("--ner-model", default="tsmatz/xlm-roberta-ner-japanese", help="Hugging Face の token-classification モデル")
+    ap.add_argument("--ner-model", default=DEFAULT_NER_MODEL, help="Hugging Face の token-classification モデル")
+    ap.add_argument("--update-model", action="store_true", help="--ner-model のモデルを Hugging Face から最新に更新する（画像の指定は不要）")
+    ap.add_argument("--model-info", action="store_true", help="モデル名・ローカルのリビジョン・キャッシュの場所を表示する（画像の指定は不要）")
     ap.add_argument("--threshold", type=float, default=0.6, help="NERのしきい値（既定 0.6。下げると拾いやすく、誤検出も増える）")
     ap.add_argument("--style", choices=["fill", "mosaic"], default="fill", help="塗りつぶし方（既定 fill）")
     ap.add_argument("--color", default="#000000", help="塗りつぶし色（既定 #000000）")
@@ -490,6 +595,11 @@ def main(argv=None):
     ap.add_argument("--show-ocr", action="store_true", help="OCRで読み取った全文を表示（取りこぼし確認用）")
     ap.add_argument("-q", "--quiet", action="store_true", help="検出結果の一覧を表示しない")
     args = ap.parse_args(argv)
+
+    if args.update_model or args.model_info:
+        if args.images or args.clipboard:
+            ap.error("--update-model / --model-info は画像と同時に指定できません")
+        return update_model(args.ner_model) if args.update_model else model_info(args.ner_model)
 
     if not args.images and not args.clipboard:
         ap.print_help()
@@ -527,22 +637,25 @@ def main(argv=None):
         if not args.outdir:
             args.outdir = str(Path("~/Desktop").expanduser())
 
-    for p in inputs:
-        p = resolve_path(p)
-        if not Path(p).exists():
-            print(f"見つかりません: {p}", file=sys.stderr)
-            print("  ヒント: ファイルを Finder からターミナルにドラッグ＆ドロップすると、正しいパスが入力されます。", file=sys.stderr)
-            continue
-        out, hits = process(p, opt, args)
-        if not args.quiet:
-            print(f"■ {p if not clip_tmp else 'クリップボード'} → {out}  （{len(hits)}箇所）")
-            for h in hits:
-                print(f"   [{h.label}] {h.text}")
+    try:
+        for p in inputs:
+            p = resolve_path(p)
+            if not Path(p).exists():
+                print(f"見つかりません: {p}", file=sys.stderr)
+                print("  ヒント: ファイルを Finder からターミナルにドラッグ＆ドロップすると、正しいパスが入力されます。", file=sys.stderr)
+                continue
+            out, hits = process(p, opt, args)
+            if not args.quiet:
+                print(f"■ {p if not clip_tmp else 'クリップボード'} → {out}  （{len(hits)}箇所）")
+                for h in hits:
+                    print(f"   [{h.label}] {h.text}")
+            if clip_tmp:
+                file_to_clipboard(out)
+                print("マスク済み画像をクリップボードにコピーしました。そのまま貼り付けできます。")
+    finally:
+        # モデルを用意できず中止した場合も、未処理の画像を一時フォルダに残さない
         if clip_tmp:
-            file_to_clipboard(out)
-            print("マスク済み画像をクリップボードにコピーしました。そのまま貼り付けできます。")
-    if clip_tmp:
-        os.remove(clip_tmp)
+            os.remove(clip_tmp)
     print("※ 自動検出は完全ではありません。送信前に必ず目視で確認してください。", file=sys.stderr)
     return 0
 

@@ -33,10 +33,16 @@ exec "$APP_DIR/venv/bin/python" "$APP_DIR/pii_shot.py" "\$@"
 EOF
 chmod +x "$BIN_DIR/pii-shot"
 
+echo "OCR モデルを準備します..."
+"$APP_DIR/venv/bin/python" -c "from rapidocr import RapidOCR; RapidOCR()" >/dev/null 2>&1 \
+  && echo "OCR モデルの準備ができました。" \
+  || echo "※ OCR モデルの事前ダウンロードに失敗しました。初回実行時に再試行されます。"
+
+# 再インストールでモデルが更新されないよう、--update-model ではなく「手元になければ取得」の処理を使う
 echo "NER モデルを事前にダウンロードします（初回のみ、約1GB）..."
-"$APP_DIR/venv/bin/python" -c "from transformers import pipeline; pipeline('token-classification', model='tsmatz/xlm-roberta-ner-japanese')" >/dev/null 2>&1 \
-  && echo "モデルの準備ができました。" \
-  || echo "※ モデルの事前ダウンロードに失敗しました。初回実行時に再試行されます。"
+PYTHONPATH="$APP_DIR" "$APP_DIR/venv/bin/python" -c "import pii_shot; pii_shot.get_ner(pii_shot.DEFAULT_NER_MODEL)" >/dev/null 2>&1 \
+  && echo "NER モデルの準備ができました。" \
+  || echo "※ NER モデルの事前ダウンロードに失敗しました。初回実行時に再試行されます。"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

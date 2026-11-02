@@ -4,7 +4,7 @@ English | [日本語](README.ja.md)
 
 A macOS command-line tool that automatically redacts personal information — names, email addresses, phone numbers, postal addresses and more — from screenshots, entirely on your machine. It is built for cleaning up screenshots before you hand them to a generative AI service, and it is tuned for Japanese screens while also handling English text.
 
-Nothing leaves your Mac. The only network access is a one-time download of the NER model from Hugging Face.
+Your images and the text read from them never leave your Mac. Models are downloaded during installation (or on first run if they are missing). After that, pii-shot connects to Hugging Face only when you run `--update-model`.
 
 | Before | After |
 |---|---|
@@ -30,7 +30,7 @@ cd pii-shot
 bash install.sh
 ```
 
-Requires Python 3.10 or later (`brew install python@3.12` if needed). The installer creates a dedicated virtual environment in `~/.pii-shot/`, adds the `pii-shot` command to `~/.local/bin/`, and pre-downloads the NER model (about 1 GB).
+Requires Python 3.10 or later (`brew install python@3.12` if needed). The installer creates a dedicated virtual environment in `~/.pii-shot/`, adds the `pii-shot` command to `~/.local/bin/`, and prepares the OCR and NER models (about 1 GB in total) so that pii-shot works offline from then on.
 
 ## Usage
 
@@ -63,6 +63,8 @@ pii-shot ~/Desktop/*.png -o ~/Desktop/masked
 | `--threshold 0.4` | NER confidence threshold (default 0.6). Lower catches more names but adds false positives |
 | `--style mosaic` | Pixelate instead of filling with a solid color |
 | `--show-ocr` | Print all OCR'd text, useful for diagnosing misses |
+| `--update-model` | Update the NER model to the latest revision from Hugging Face (no image needed) |
+| `--model-info` | Show the model name, local revision and cache location (no image needed) |
 
 ### Words to always hide
 
@@ -86,6 +88,34 @@ osascript -e 'display notification "Redacted image copied" with title "pii-shot"
 
 Then assign it a keyboard shortcut in the shortcut's settings. macOS will ask for Screen Recording permission on first run.
 
+## Updating the model
+
+The NER model is never updated automatically, so detection results do not change without you knowing. To update it:
+
+1. Run `pii-shot --update-model`. It shows the revision before and after, or reports that there was no update.
+2. Run `pii-shot your-test-image.png -p` on a local test image and check the results.
+
+If the network is unavailable, the command exits with an error and your existing model keeps working.
+
+## Uninstalling
+
+Run these commands in order. The first one uses a tool inside pii-shot's virtual environment, so it must run before that environment is removed.
+
+```bash
+# Delete the NER model (about 1 GB) from the Hugging Face cache
+~/.pii-shot/venv/bin/hf cache rm model/tsmatz/xlm-roberta-ner-japanese
+
+# Delete the virtual environment, the OCR models inside it, and the command
+rm -rf ~/.pii-shot ~/.local/bin/pii-shot
+```
+
+Deleting the model's folder with `rm` is not enough, because the model files can be stored in a location shared across the Hugging Face cache. Skip the first command if other tools on your Mac use the same model, and repeat it for any other model you downloaded with `--ner-model`.
+
+Optionally, you can also:
+
+- delete your word list: `rm ~/.pii-shot-words.txt`;
+- remove the `export PATH="$HOME/.local/bin:$PATH"` line from `~/.zshrc`, if the installer added it and nothing else needs it.
+
 ## Limitations
 
 - **Detection is not perfect, and this tool does not guarantee anonymization.** Always check the result before sharing it; the `-p` preview makes this quick.
@@ -97,7 +127,7 @@ Then assign it a keyboard shortcut in the shortcut's settings. macOS will ask fo
 
 ## Dependencies
 
-All dependencies are installed by pip or downloaded at runtime; none are bundled in this repository.
+Packages are installed by pip, and models are obtained during installation (or on first run if they are missing). None are bundled in this repository.
 
 | Component | License |
 |---|---|
